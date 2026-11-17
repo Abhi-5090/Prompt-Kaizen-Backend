@@ -41,10 +41,14 @@ const TONE_KEYWORDS = [
   'serious','witty','warm','authoritative','tone'
 ];
 
+// Specific role / persona words only. Earlier this list also contained
+// generic English words like "audience", "users", "team" — almost any prompt
+// mentions at least one of those, which inflated the Input Parameters score
+// to easy 6/15 for free. Now the prompt has to name an actual audience.
 const AUDIENCE_KEYWORDS = [
   'student','students','principal','hr','recruiter','developer','developers',
-  'customer','customers','client','clients','team','manager','manager','employees',
-  'audience','readers','users','beginners','experts','children','professor','teacher',
+  'customer','customers','client','clients','manager','employees',
+  'readers','beginners','experts','children','professor','teacher',
   'investors','stakeholders'
 ];
 
@@ -90,7 +94,6 @@ function analyzePrompt(input) {
     category = '',
     scenario = '',
     userPrompt = '',
-    expectedOutputFormat = '',
     tone = '',
     targetAudience = '',
     additionalRequirements = '',
@@ -133,8 +136,58 @@ function analyzePrompt(input) {
   const overlap = scenarioWords.filter((w) => promptMeaningful.has(w));
   const overlapRatio = scenarioWords.length === 0 ? 0 : overlap.length / scenarioWords.length;
 
+  // How much of the prompt is the learner's own wording rather than the
+  // scenario's. Needed by both Context and Relevance, so computed once here.
+  const scenarioSet = new Set(scenarioWords);
+  const promptOwnWords = [...promptMeaningful].filter((w) => !scenarioSet.has(w));
+  const originality = promptMeaningful.size === 0
+    ? 0
+    : promptOwnWords.length / promptMeaningful.size;
+
+  // Verbatim paste detection.
+  //
+  // Bag-of-words ratios cannot separate "pasted the scenario, then appended a
+  // few keywords" from genuine work: appending text lifts the originality
+  // ratio while overlap stays at 1.0, which scored 92/100. Contiguous runs
+  // catch that specific move directly — a learner writing in their own words
+  // does not reproduce a 10-word span of the brief exactly.
+  const normalize = (t) => String(t).toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const normScenario = normalize(scenario);
+  const normPrompt = normalize(promptText);
+
+  let longestVerbatimRun = 0;
+  if (normScenario && normPrompt) {
+    const sWords = normScenario.split(' ');
+    // Walk decreasing span lengths and stop at the first contiguous run of
+    // scenario text that also appears in the prompt.
+    for (let len = Math.min(sWords.length, 40); len >= 5; len--) {
+      let found = false;
+      for (let i = 0; i + len <= sWords.length; i++) {
+        if (normPrompt.includes(sWords.slice(i, i + len).join(' '))) { found = true; break; }
+      }
+      if (found) { longestVerbatimRun = len; break; }
+    }
+  }
+  // Proportion of the brief reproduced word-for-word.
+  const verbatimRatio = scenarioWords.length === 0
+    ? 0
+    : Math.min(1, longestVerbatimRun / Math.max(1, normScenario.split(' ').length));
+  const isPasted = longestVerbatimRun >= 8 || verbatimRatio >= 0.5;
+
   let context = Math.round(overlapRatio * 15);
   if (wordCount >= 25) context = Math.min(15, context + 2);
+
+  // Copying the scenario into the prompt used to earn full Context marks,
+  // which made paste-the-scenario the single highest-yield way to score. These
+  // points are for weaving the situation into an instruction, so they are
+  // damped when almost nothing in the prompt is the learner's own wording.
+  if (originality < 0.15) context = Math.round(context * 0.4);
+  else if (originality < 0.30) context = Math.round(context * 0.7);
+
+  // Pasting the brief verbatim is not supplying context, whatever else was
+  // appended around it.
+  if (isPasted) context = Math.min(context, 5);
+
   context = Math.max(0, Math.min(15, context));
 
   if (overlapRatio >= 0.4) {
@@ -203,18 +256,16 @@ function analyzePrompt(input) {
   if (inputs >= 10) strengths.push('Provides useful input parameters / audience info.');
   else weaknesses.push('Important input parameters are missing.');
 
-  // 6) Output Format (10). Full marks if the format is named explicitly,
-  // either via the dropdown or anywhere inside the prompt text.
-  const formatProvided = !!String(expectedOutputFormat).trim();
-  const formatMentioned =
-    formatProvided ||
-    FORMAT_KEYWORDS.some((k) => promptLower.includes(k));
+  // 6) Output Format (10). The user must state the desired output format
+  // (email / table / bullet points / etc.) inside the prompt text itself —
+  // there is no separate dropdown to fall back on.
+  const formatMentioned = FORMAT_KEYWORDS.some((k) => promptLower.includes(k));
   let outputFormat = 0;
   if (formatMentioned) {
     outputFormat = 10;
     strengths.push('Specifies an output format.');
   } else {
-    missing.push('Expected Output Format');
+    missing.push('Output Format');
     suggestions.push('State the format clearly (e.g., email, table, bullet points).');
   }
 
@@ -223,19 +274,18 @@ function analyzePrompt(input) {
   // full marks. An explicit `additionalRequirements` field also earns full.
   const constraintProvided = !!String(additionalRequirements).trim();
   let constraints = 0;
-  if (constraintProvided || constraintMatchCount >= 7) {
+  if (constraintProvided || constraintMatchCount >= 5) {
     constraints = 10;
     strengths.push('Includes constraints / requirements.');
-  } else if (constraintMatchCount === 4) {
+  } else if (constraintMatchCount >= 3) {
     constraints = 6;
-    strengths.push('Includes at least three constraint / requirement.');
+    strengths.push('Includes several constraints / requirements.');
     suggestions.push('Add more constraints (length, examples, sections...) for full credit.');
-  }else if (constraintMatchCount === 1) {
+  } else if (constraintMatchCount >= 1) {
     constraints = 3;
     strengths.push('Includes at least one constraint / requirement.');
     suggestions.push('Add more constraints (length, examples, sections...) for full credit.');
-  }
-   else {
+  } else {
     missing.push('Constraints');
     suggestions.push('Add constraints such as word limit, sections, or tone limits.');
   }
@@ -255,13 +305,36 @@ function analyzePrompt(input) {
     suggestions.push('Mention the desired tone (professional, formal, friendly...).');
   }
 
-  // 9) Relevance (5) — keyword overlap with scenario
-  let relevance = Math.round(overlapRatio * 5);
+  // 9) Relevance (5) — is the prompt ON-TOPIC, and is it doing more than
+  // parroting the scenario back?
+  //
+  // This used to be `overlapRatio * 5`, the identical signal Context (15) is
+  // built from — so the same keyword overlap was paid for twice, 20 of the 100
+  // points moved together, and the single most effective way to score highly
+  // was to copy the scenario into the prompt. Relevance now measures topicality
+  // while penalising verbatim copying, so the two parameters can diverge.
+  let relevance = 0;
+  if (overlapRatio >= 0.12) relevance += 3;       // on-topic at all
+  else if (overlapRatio >= 0.05) relevance += 1;  // tenuously related
+
+  // Does the prompt contribute wording of its own, or is it a copy?
+  if (originality >= 0.45) relevance += 2;
+  else if (originality >= 0.25) relevance += 1;
+
+  // Near-verbatim restatement of the scenario: almost every meaningful word is
+  // borrowed and little is added. That is copying, not prompt engineering.
+  const isEcho = isPasted || (overlapRatio >= 0.75 && originality < 0.2);
+  if (isEcho) {
+    relevance = Math.min(relevance, 1);
+    weaknesses.push('Prompt largely restates the scenario instead of instructing the model.');
+    suggestions.push('Write instructions in your own words — state the role, task, format and limits.');
+  }
+
   relevance = Math.max(0, Math.min(5, relevance));
-  if (relevance >= 4) strengths.push('Prompt is highly relevant to the scenario.');
-  else if (relevance <= 2) {
+  if (relevance >= 4) strengths.push('Prompt is relevant and adds its own instruction.');
+  else if (relevance <= 2 && !isEcho) {
     weaknesses.push('Prompt is loosely relevant to the scenario.');
-    suggestions.push('Use key terms from the scenario directly in the prompt.');
+    suggestions.push('Reference the specifics of the scenario in your instructions.');
   }
 
   // 10) Grammar & Structure (5)
@@ -321,6 +394,10 @@ function analyzePrompt(input) {
     meta: {
       wordCount,
       overlapRatio: round(overlapRatio),
+      originality: round(originality),
+      isEcho,
+      isPasted,
+      longestVerbatimRun,
       hasAction,
       hasRole,
       category,

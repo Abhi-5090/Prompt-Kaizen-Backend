@@ -1,7 +1,6 @@
 const Contest = require('../models/Contest');
 const ContestSubmission = require('../models/ContestSubmission');
-const { analyzePrompt } = require('../utils/promptAnalyzer');
-const { generateImprovedPrompt } = require('../utils/generateImprovedPrompt');
+const { evaluatePrompt } = require('../utils/llmAnalyzer');
 const { istDayKey, isSameIstDay } = require('../utils/dailyChallenge');
 
 function userEmail(req) {
@@ -26,6 +25,39 @@ function isLiveNow(contest, now = new Date()) {
   }
   return isSameIstDay(contest.scheduledDate, now);
 }
+
+/**
+ * The instant this user's attempt must be in by: the earlier of the contest
+ * window closing and their personal `durationMinutes` running out from when
+ * they started.
+ *
+ * This used to be computed only in the browser, which meant the per-user
+ * duration was advisory — anyone who ignored the on-screen timer could keep
+ * working until the window itself closed and still submit. The frontend timer
+ * remains for UX; this is the value that actually decides.
+ *
+ * Returns null when neither cap applies (legacy contest, never started).
+ */
+function deadlineFor(contest, submission) {
+  const candidates = [];
+  if (contest.endsAt) candidates.push(new Date(contest.endsAt).getTime());
+  if (submission?.startedAt && contest.durationMinutes) {
+    candidates.push(
+      new Date(submission.startedAt).getTime() + contest.durationMinutes * 60_000
+    );
+  }
+  return candidates.length ? Math.min(...candidates) : null;
+}
+
+// Submissions that arrive a moment after the deadline are accepted rather than
+// discarded — the client auto-submits a few seconds early, and network latency
+// should not cost someone their entire attempt. Anything beyond this is late.
+const SUBMIT_GRACE_MS = 10_000;
+
+// Neither leaderboard aggregation had a $limit: every request built and
+// returned a row for every submission in the collection, then serialised the
+// lot. Capped at a length no leaderboard UI scrolls past.
+const LEADERBOARD_LIMIT = Number(process.env.LEADERBOARD_LIMIT) || 500;
 
 /**
  * Lists contests visible to the calling user, in three buckets:
@@ -96,6 +128,17 @@ const getContestForUser = async (req, res) => {
       userId: req.user._id,
     }).lean();
 
+    const live = isLiveNow(contest);
+    // Scenarios are the exam paper. They used to be returned as soon as a
+    // contest was published, so any allow-listed user could read every
+    // question ahead of time with a single API call and arrive with answers
+    // prepared — the `live` flag in the response was respected by the UI but
+    // not by anything else. They are now withheld until the window opens, and
+    // released again afterwards to whoever already submitted, so results
+    // pages can still show the question next to the answer.
+    const alreadySubmitted = mySubmission?.status === 'submitted';
+    const maySeeScenarios = live || alreadySubmitted;
+
     return res.json({
       contest: {
         _id: contest._id,
@@ -105,10 +148,13 @@ const getContestForUser = async (req, res) => {
         startsAt: contest.startsAt,
         endsAt: contest.endsAt,
         durationMinutes: contest.durationMinutes,
-        scenarios: contest.scenarios,
+        scenarios: maySeeScenarios ? contest.scenarios : [],
+        scenariosCount: (contest.scenarios || []).length,
+        scenariosLocked: !maySeeScenarios,
         status: contest.status,
       },
-      live: isLiveNow(contest),
+      live,
+      deadline: mySubmission ? deadlineFor(contest, mySubmission) : null,
       mySubmission,
     });
   } catch (err) {
@@ -127,23 +173,34 @@ const startContest = async (req, res) => {
     if (!isLiveNow(contest))
       return res.status(409).json({ message: 'This contest is not open right now. Check the start and end times.' });
 
-    let sub = await ContestSubmission.findOne({
+    // Fast-path: if a submission already exists and is submitted, reject.
+    const existing = await ContestSubmission.findOne({
       contestId: contest._id,
       userId: req.user._id,
-    });
-    if (sub && sub.status === 'submitted')
+    }).lean();
+    if (existing && existing.status === 'submitted')
       return res.status(409).json({ message: 'You have already submitted this contest.' });
 
-    if (!sub) {
-      sub = await ContestSubmission.create({
-        contestId: contest._id,
-        userId: req.user._id,
-        startedAt: new Date(),
-        answers: [],
-        status: 'in_progress',
-      });
-    }
-    return res.json({ submission: sub });
+    // Atomic upsert: two parallel "Start" clicks no longer race the unique
+    // {contestId,userId} index and surface as a 500. `$setOnInsert` only fires
+    // on initial creation; an existing in-progress submission is returned
+    // unchanged.
+    const sub = await ContestSubmission.findOneAndUpdate(
+      { contestId: contest._id, userId: req.user._id },
+      {
+        $setOnInsert: {
+          contestId: contest._id,
+          userId: req.user._id,
+          startedAt: new Date(),
+          answers: [],
+          status: 'in_progress',
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+    // Hand back the authoritative deadline so the client renders a timer
+    // derived from server state rather than computing its own.
+    return res.json({ submission: sub, deadline: deadlineFor(contest, sub) });
   } catch (err) {
     console.error('startContest error:', err);
     return res.status(500).json({ message: 'Failed to start contest.' });
@@ -161,15 +218,30 @@ const submitContest = async (req, res) => {
     if (!contest) return res.status(404).json({ message: 'Contest not found.' });
     if (!isEligibleFor(contest, email))
       return res.status(403).json({ message: 'You are not eligible for this contest.' });
+    // The contest window is the absolute ceiling — even a mid-contest user
+    // can't submit after endsAt. The per-user duration is a separate cap on
+    // how long any single user has from startedAt, but the window always
+    // wins when it's the sooner of the two. Matches the frontend timer.
     if (!isLiveNow(contest))
       return res.status(409).json({ message: 'This contest window has not started or has already ended.' });
 
     const existing = await ContestSubmission.findOne({
       contestId: contest._id,
       userId: req.user._id,
-    });
+    }).lean();
     if (existing && existing.status === 'submitted')
       return res.status(409).json({ message: 'You have already submitted this contest.' });
+
+    // Enforce the per-user time limit here, not just in the browser. Without
+    // this, `durationMinutes` was decorative: the client drew a countdown but
+    // a user who ignored it could keep editing until the window closed.
+    const deadline = deadlineFor(contest, existing);
+    if (deadline !== null && Date.now() > deadline + SUBMIT_GRACE_MS) {
+      return res.status(409).json({
+        message: 'Your time for this contest has run out.',
+        deadline,
+      });
+    }
 
     const submitted = Array.isArray(req.body?.answers) ? req.body.answers : [];
     const answers = [];
@@ -186,17 +258,12 @@ const submitContest = async (req, res) => {
       };
       let improvedPrompt = '';
       if (userPrompt.length >= 5) {
-        analysis = analyzePrompt({
+        analysis = await evaluatePrompt({
           category: sc.category,
           scenario: sc.scenario,
           userPrompt,
-          expectedOutputFormat: sc.expectedOutputFormat,
         });
-        improvedPrompt = generateImprovedPrompt({
-          category: sc.category,
-          scenario: sc.scenario,
-          expectedOutputFormat: sc.expectedOutputFormat,
-        });
+        improvedPrompt = analysis.improvedPrompt;
       }
 
       answers.push({
@@ -218,18 +285,44 @@ const submitContest = async (req, res) => {
       ? Math.round((totalScore / answers.length) * 10) / 10
       : 0;
 
-    const sub =
-      existing ||
-      new ContestSubmission({
-        contestId: contest._id,
-        userId: req.user._id,
-        startedAt: new Date(),
-      });
-    sub.answers = answers;
-    sub.averageScore = averageScore;
-    sub.status = 'submitted';
-    sub.submittedAt = new Date();
-    await sub.save();
+    const finalFields = {
+      answers,
+      averageScore,
+      status: 'submitted',
+      submittedAt: new Date(),
+    };
+
+    // Atomic finalisation. Two concurrent submits used to both read the same
+    // in_progress doc and both call save(), clobbering each other's answers
+    // (leaderboard score became non-deterministic). The findOneAndUpdate below
+    // only matches a doc that is still in_progress (or non-existent if the
+    // user never called start). If we lose the race, return 409.
+    let sub;
+    if (existing) {
+      sub = await ContestSubmission.findOneAndUpdate(
+        { _id: existing._id, status: 'in_progress' },
+        { $set: finalFields },
+        { new: true }
+      );
+      if (!sub) {
+        return res.status(409).json({ message: 'You have already submitted this contest.' });
+      }
+    } else {
+      try {
+        sub = await ContestSubmission.create({
+          contestId: contest._id,
+          userId: req.user._id,
+          startedAt: new Date(),
+          ...finalFields,
+        });
+      } catch (e) {
+        // Unique index collision: a concurrent submit beat us.
+        if (e?.code === 11000) {
+          return res.status(409).json({ message: 'You have already submitted this contest.' });
+        }
+        throw e;
+      }
+    }
 
     return res.json({ submission: sub });
   } catch (err) {
@@ -248,7 +341,12 @@ const getMyResult = async (req, res) => {
       userId: req.user._id,
     }).lean();
     if (!sub) return res.status(404).json({ message: 'No submission found.' });
-    const contest = await Contest.findById(req.params.id).lean();
+    // Project only the contest fields the result UI needs. Critically, never
+    // return `allowedEmails` — that array is the full PII roster of every
+    // invited user and must not leak to other participants.
+    const contest = await Contest.findById(req.params.id)
+      .select('title description scheduledDate startsAt endsAt durationMinutes scenarios status')
+      .lean();
     return res.json({ submission: sub, contest });
   } catch (err) {
     console.error('getMyResult error:', err);
@@ -259,6 +357,20 @@ const getMyResult = async (req, res) => {
 /** A user is allowed to view a contest's leaderboard if they're on its
  *  allowlist — regardless of contest status (so they can also see results
  *  for closed contests). */
+// Mask an email so a participant can recognise their own row but can't read
+// other participants' addresses verbatim. e.g. `john.doe@example.com` →
+// `joh***@example.com`. The caller's own row is passed through unchanged so
+// they always see their full email.
+function maskEmail(email) {
+  if (!email || typeof email !== 'string') return '';
+  const at = email.indexOf('@');
+  if (at <= 0) return '***';
+  const local = email.slice(0, at);
+  const domain = email.slice(at);
+  const visible = local.slice(0, Math.min(3, local.length));
+  return `${visible}***${domain}`;
+}
+
 function isOnAllowlist(contest, email) {
   if (!contest || !Array.isArray(contest.allowedEmails)) return false;
   return contest.allowedEmails.includes(email);
@@ -316,14 +428,16 @@ const getContestLeaderboard = async (req, res) => {
         },
       },
       { $sort: { score: -1, timeMs: 1 } },
+      { $limit: LEADERBOARD_LIMIT },
     ]);
 
     const callerId = String(req.user?._id || '');
-    const ranked = rows.map((r, i) => ({
-      ...r,
-      rank: i + 1,
-      isMe: String(r.userId) === callerId,
-    }));
+    const ranked = rows.map((r, i) => {
+      const isMe = String(r.userId) === callerId;
+      // Mask everyone else's email so a participant can't scrape the full
+      // allowlist by hitting the leaderboard. Caller sees their own address.
+      return { ...r, email: isMe ? r.email : maskEmail(r.email), rank: i + 1, isMe };
+    });
 
     return res.json({
       contest: {
@@ -407,14 +521,14 @@ const leaderboard = async (req, res) => {
       },
       // Primary: highest avg score. Tiebreaker: lowest avg submit time.
       { $sort: { avgScore: -1, avgTimeMs: 1 } },
+      { $limit: LEADERBOARD_LIMIT },
     ]);
 
     const callerId = String(req.user?._id || '');
-    const ranked = rows.map((r, i) => ({
-      ...r,
-      rank: i + 1,
-      isMe: String(r.userId) === callerId,
-    }));
+    const ranked = rows.map((r, i) => {
+      const isMe = String(r.userId) === callerId;
+      return { ...r, email: isMe ? r.email : maskEmail(r.email), rank: i + 1, isMe };
+    });
 
     return res.json({ leaderboard: ranked, total: ranked.length });
   } catch (err) {

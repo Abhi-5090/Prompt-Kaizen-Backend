@@ -11,10 +11,17 @@ const connectDB = require('../config/db');
 const User = require('../models/User');
 
 async function main() {
-  await connectDB();
+  // A one-shot CLI must not inherit the server's retry-forever policy: if the
+  // database is unreachable the operator wants an error now, not a hung shell.
+  await connectDB({ retries: 3, baseDelayMs: 1000, maxDelayMs: 4000 });
 
   const name = process.env.ADMIN_NAME || 'Admin';
-  const email = (process.env.ADMIN_EMAIL || 'admin@promptkaizen.local').toLowerCase().trim();
+  // Default must match .env.example (ADMIN_EMAIL=Admin). When the two
+  // diverged, operators who copied .env.example and ran seed once, then ran
+  // seed again without the env vars, ended up with TWO admin accounts at
+  // different identifiers — and `deleteUser` blocks admin removal, so the
+  // duplicate is painful to clean up.
+  const email = (process.env.ADMIN_EMAIL || 'Admin').toLowerCase().trim();
   const password = process.env.ADMIN_PASSWORD || 'ChangeMe123!';
 
   let user = await User.findOne({ email });
@@ -36,7 +43,16 @@ async function main() {
   process.exit(0);
 }
 
-main().catch((err) => {
-  console.error('seedAdmin failed:', err);
-  process.exit(1);
-});
+// Only auto-run when invoked directly via `node utils/seedAdmin.js` (which
+// is how `npm run seed:admin` calls it). Guarding against accidental
+// `require('./utils/seedAdmin.js')` from another script — that would
+// silently mutate the admin record (potentially resetting the password
+// when ADMIN_RESET_PASSWORD=true) without anyone meaning to.
+if (require.main === module) {
+  main().catch((err) => {
+    console.error('seedAdmin failed:', err);
+    process.exit(1);
+  });
+}
+
+module.exports = { main };

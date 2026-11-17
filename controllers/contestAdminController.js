@@ -4,6 +4,7 @@ const User = require('../models/User');
 const { parseEmailsFromBuffer } = require('../utils/parseEmails');
 const { ALLOWED_CATEGORIES } = require('./promptController');
 const { istDateTimeToUtc } = require('../utils/dailyChallenge');
+const { paginate } = require('../utils/pagination');
 
 /**
  * Stores `scheduledDate` as the UTC instant of midnight on the chosen IST day,
@@ -65,8 +66,6 @@ function validateScenarios(scenarios) {
     const s = scenarios[i] || {};
     if (!s.category || !ALLOWED_CATEGORIES.includes(s.category))
       return `Scenario ${i + 1}: invalid category.`;
-    if (!s.expectedOutputFormat || typeof s.expectedOutputFormat !== 'string')
-      return `Scenario ${i + 1}: expectedOutputFormat is required.`;
     if (!s.scenario || String(s.scenario).trim().length < 10)
       return `Scenario ${i + 1}: scenario text must be at least 10 characters.`;
   }
@@ -172,7 +171,28 @@ const updateContest = async (req, res) => {
     if (scenarios !== undefined) {
       const err = validateScenarios(scenarios);
       if (err) return res.status(400).json({ message: err });
-      contest.scenarios = scenarios;
+
+      // Changing the questions after people have started is not an edit, it
+      // is a different exam. Anyone who already answered would be scored
+      // against a scenario they never saw, and anyone mid-attempt would have
+      // the paper swapped underneath them. Allowed only while no one has
+      // started; otherwise the admin must close this contest and create a
+      // new one.
+      const scenariosChanged =
+        JSON.stringify((contest.scenarios || []).map((x) => ({ c: x.category, s: x.scenario }))) !==
+        JSON.stringify(scenarios.map((x) => ({ c: x.category, s: String(x.scenario).trim() })));
+
+      if (scenariosChanged) {
+        const attempts = await ContestSubmission.countDocuments({ contestId: contest._id });
+        if (attempts > 0) {
+          return res.status(409).json({
+            message:
+              `Scenarios cannot be changed — ${attempts} participant(s) have already started ` +
+              'this contest. Close it and create a new one instead.',
+          });
+        }
+        contest.scenarios = scenarios;
+      }
     }
     await contest.save();
     return res.json({ contest });
@@ -203,21 +223,35 @@ const uploadAllowedEmails = async (req, res) => {
     const contest = await Contest.findById(req.params.id);
     if (!contest) return res.status(404).json({ message: 'Contest not found.' });
 
-    const { emails, skipped } = parseEmailsFromBuffer(req.file.buffer);
+    const { emails, skipped, capped } = parseEmailsFromBuffer(req.file.buffer);
 
-    const mode = (req.body.mode || 'replace').toLowerCase(); // 'replace' or 'append'
+    // Default mode is 'append' — uploading a second file should ADD to the
+    // existing allowlist, never silently wipe it. The admin must explicitly
+    // opt in to 'replace' (the UI does this with a confirm dialog). If the
+    // mode field is missing or unrecognised, we default to the safe behavior
+    // so a buggy or older client can't accidentally destroy the allowlist.
+    const rawMode = String(req.body.mode || '').toLowerCase();
+    const mode = rawMode === 'replace' ? 'replace' : 'append';
+
+    let added = 0;
     if (mode === 'append') {
       const existing = new Set(contest.allowedEmails || []);
+      const before = existing.size;
       for (const e of emails) existing.add(e);
+      added = existing.size - before;
       contest.allowedEmails = Array.from(existing);
     } else {
       contest.allowedEmails = emails;
+      added = emails.length;
     }
     await contest.save();
     return res.json({
       contest,
+      mode,
       parsed: emails.length,
+      added,                       // how many NEW unique emails landed
       skipped,
+      capped,
       total: contest.allowedEmails.length,
     });
   } catch (err) {
@@ -260,11 +294,15 @@ const getContestDetail = async (req, res) => {
   try {
     const contest = await Contest.findById(req.params.id).lean();
     if (!contest) return res.status(404).json({ message: 'Contest not found.' });
-    const submissions = await ContestSubmission.find({ contestId: contest._id })
-      .populate('userId', 'name email')
-      .sort({ averageScore: -1, submittedAt: -1 })
-      .lean();
-    return res.json({ contest, submissions });
+    // A popular contest can have thousands of submissions; the detail page
+    // renders a ranked table, so it pages like every other admin list.
+    const { items, pagination } = await paginate(ContestSubmission, {
+      filter: { contestId: contest._id },
+      sort: { averageScore: -1, submittedAt: -1 },
+      query: req.query,
+      populate: [['userId', 'name email']],
+    });
+    return res.json({ contest, submissions: items, items, pagination });
   } catch (err) {
     console.error('getContestDetail error:', err);
     return res.status(500).json({ message: 'Failed to load contest.' });
